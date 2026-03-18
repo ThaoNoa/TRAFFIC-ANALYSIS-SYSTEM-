@@ -4,8 +4,8 @@ Tích hợp: YOLOv8 (phát hiện), DeepSORT (theo dõi),
 Pose Analysis, Road Analysis
 """
 
-import cv2
 import tkinter as tk
+import cv2
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 import threading
@@ -15,18 +15,22 @@ from datetime import datetime
 import os
 import sys
 import numpy as np
+from modules.utils import draw_info_panel, draw_timestamp, save_frame, iou
 # Thêm thư mục hiện tại vào path để import modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import modules
 from modules.road_analysis import RoadAnalyzer
+from modules.road_segmentation_yolov8seg import RoadSegmentorYOLOSeg   # nếu bạn định dùng YOLOv8-Seg
 from modules.detection import VehicleDetector
 from modules.tracking import SimpleTracker
 from modules.road_integrator import RoadIntegrator
 from modules.pose_analysis_simple import PoseAnalyzer
 from modules.violation_detector import ViolationDetector
 from modules.utils import draw_info_panel, draw_timestamp, save_frame
-
+from modules.road_segmentation_yolov8seg import RoadSegmentorYOLOSeg
+from modules.ipm_transform import IPMTransformer
+from modules.tracking_deepsort import DeepSORTTracker
 
 class TrafficAnalysisApp:
     def __init__(self, root):
@@ -34,6 +38,20 @@ class TrafficAnalysisApp:
         self.root.title("Hệ thống phân tích giao thông Lĩnh Nam - AI Pro")
         self.root.geometry("1600x900")
         self.road_analyzer = RoadAnalyzer()
+        self.use_yolov8_seg = False  # Mặc định dùng OpenCV
+        self.segmentor_yolo = None  # Sẽ khởi tạo nếu cần
+        self.ipm = None
+        self.src_points = None  #[(100, 400), (500, 400), (50, 600), (550, 600)]  # (x,y) trên ảnh gốc
+        self.dst_points = None  #[(0, 0), (10, 0), (0, 10), (10, 10)]  # tọa độ thế giới (mét)
+        # Biến cho pose analysis theo track
+        self.pose_results_per_track = {}  # track_id -> góc nghiêng, confidence
+
+        # Biến cho TensorRT
+        self.use_tensorrt = False
+
+        self.track_history = {}
+        self.speed_history = {}
+        self.pose_results_per_track = {}
         # Khởi tạo các module
         print("=" * 70)
         print("KHỞI TẠO HỆ THỐNG PHÂN TÍCH GIAO THÔNG THÔNG MINH")
@@ -44,7 +62,7 @@ class TrafficAnalysisApp:
             self.detector = VehicleDetector()
 
             print("2. Khởi tạo SimpleTracker...")
-            self.tracker = SimpleTracker()
+            self.tracker = DeepSORTTracker(lambda_motion=0.7, max_age=30)
 
             print("3. Khởi tạo RoadIntegrator...")
             self.road_integrator = RoadIntegrator()
@@ -141,6 +159,14 @@ class TrafficAnalysisApp:
                    command=self.stop_analysis).grid(row=0, column=3, padx=5)
         ttk.Button(control_frame, text="📸 Chụp ảnh",
                    command=self.capture_image).grid(row=0, column=4, padx=5)
+        # Checkbox chọn phương pháp phân đoạn đường
+        self.seg_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(control_frame, text="Dùng YOLOv8-Seg", variable=self.seg_var,
+                        command=self.toggle_seg_method).grid(row=0, column=5, padx=5)
+        # Checkbox dùng TensorRT
+        self.trt_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(control_frame, text="TensorRT", variable=self.trt_var,
+                        command=self.toggle_tensorrt).grid(row=0, column=6, padx=5)
 
         # Info bar
         info_frame = ttk.Frame(left_frame)
@@ -226,6 +252,29 @@ class TrafficAnalysisApp:
         self.log("🚀 Hệ thống AI phân tích giao thông đã khởi động")
         self.log("📌 Chọn video để bắt đầu phân tích")
 
+    def toggle_seg_method(self):
+        self.use_yolov8_seg = self.seg_var.get()
+        if self.use_yolov8_seg and self.segmentor_yolo is None:
+            # Khởi tạo YOLOv8-seg với fallback là road_integrator hiện tại
+            try:
+                self.segmentor_yolo = RoadSegmentorYOLOSeg(
+                    model_path='yolov8n-seg.pt',  # Đường dẫn model đã fine-tune
+                    fallback=self.road_integrator.segmentation  # fallback OpenCV
+                )
+                self.log("✅ Đã chuyển sang YOLOv8-Seg")
+            except Exception as e:
+                self.log(f"❌ Không thể khởi tạo YOLOv8-Seg: {e}")
+                self.seg_var.set(False)
+                self.use_yolov8_seg = False
+        else:
+            self.log("ℹ️ Đang dùng OpenCV segmentation")
+
+    def toggle_tensorrt(self):
+        self.use_tensorrt = self.trt_var.get()
+        # Khi thay đổi, cần khởi tạo lại detector với engine mới? Hoặc chỉ ảnh hưởng lần chạy sau.
+        # Ở đây ta chỉ log và khi start analysis sẽ dùng giá trị này.
+        self.log(f"TensorRT: {'Bật' if self.use_tensorrt else 'Tắt'}")
+
     def open_video(self):
         """Mở file video"""
         file_path = filedialog.askopenfilename(
@@ -280,6 +329,15 @@ class TrafficAnalysisApp:
             'bicycles': 0,
             'violations': 0
         }
+
+        if self.use_tensorrt:
+            engine_path = 'yolov8n_fp16.engine'
+            if os.path.exists(engine_path):
+                self.detector = VehicleDetector(model_path=engine_path, use_tensorrt=True)
+                self.log("✅ Đã chuyển sang TensorRT engine")
+            else:
+                self.log("⚠️ Không tìm thấy TensorRT engine, dùng PyTorch")
+
         if not self.video_path:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn video!")
             return
@@ -344,10 +402,68 @@ class TrafficAnalysisApp:
             if not self.is_paused and not self.frame_queue.empty():
                 frame = self.frame_queue.get()
 
-                try:
-                    # === BƯỚC 1: PHÂN TÍCH MẶT ĐƯỜNG ===
+                # === BƯỚC 1: PHÂN TÍCH MẶT ĐƯỜNG (TÁCH RIÊNG) ===
+                # Gọi segmentation
+                road_mask, sidewalk_mask, roi_coords, seg_info = self.road_integrator.segmentation.extract_road_and_sidewalk(
+                    frame)
+                y1, y2, x1, x2 = roi_coords
+                road_region = self.road_integrator.segmentation.get_road_region(frame, road_mask, roi_coords)
+
+                # Gọi analysis
+                road_analysis_result = self.road_integrator.analyzer.analyze(road_region)
+
+                # Kết hợp kết quả
+                road_result = {
+                    **road_analysis_result,
+                    'roi_coords': roi_coords,
+                    'road_mask': road_mask,
+                    'sidewalk_mask': sidewalk_mask,
+                    'road_area': seg_info.get('road_area', 0)
+                }
+
+                # --- TỰ VẼ LÊN FRAME (đảm bảo hiển thị) ---
+                frame_with_road = frame.copy()
+
+                # Tô màu lòng đường (nếu có)
+                if road_mask is not None and np.any(road_mask):
+                    overlay = frame_with_road.copy()
+                    overlay[road_mask > 0] = (0, 255, 0)  # xanh lá
+                    cv2.addWeighted(overlay, 0.15, frame_with_road, 0.85, 0, frame_with_road)
+
+                # Vẽ viền ROI
+                cv2.rectangle(frame_with_road, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                cv2.putText(frame_with_road, "LONG DUONG CHINH", (x1 + 10, y1 + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # Vẽ ổ gà
+                for cnt in road_result.get('pothole_contours', []):
+                    cnt_abs = cnt.copy()
+                    cnt_abs[:, :, 0] += x1
+                    cnt_abs[:, :, 1] += y1
+                    cv2.drawContours(frame_with_road, [cnt_abs], -1, (0, 0, 255), 2)
+                    M = cv2.moments(cnt_abs)
+                    if M['m00'] > 0:
+                        cx = int(M['m10'] / M['m00'])
+                        cy = int(M['m01'] / M['m00'])
+                        cv2.putText(frame_with_road, "O GA", (cx - 30, cy - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                # Vẽ vết nứt
+                for cnt in road_result.get('crack_contours', []):
+                    cnt_abs = cnt.copy()
+                    cnt_abs[:, :, 0] += x1
+                    cnt_abs[:, :, 1] += y1
+                    cv2.drawContours(frame_with_road, [cnt_abs], -1, (0, 165, 255), 2)
+                else:
+                    # Dùng road_integrator cũ
                     road_result, frame_with_road = self.road_integrator.process(frame)
-                    road_mask = road_result.get('road_mask')
+                    print("=== DEBUG ROAD ===")
+                    print("road_mask:", road_result.get('road_mask') is not None)
+                    if road_result.get('road_mask') is not None:
+                        print("road_mask sum:", np.sum(road_result['road_mask'] > 0))
+                    print("pothole_count:", road_result.get('pothole_count'))
+                    print("crack_count:", road_result.get('crack_count'))
+                    print("roi_coords:", road_result.get('roi_coords'))
 
                     # === BƯỚC 2: PHÁT HIỆN PHƯƠNG TIỆN (YOLOv8) ===
                     # Yêu cầu trả về vehicle mask để loại trừ khỏi phân tích hư hỏng
@@ -360,11 +476,46 @@ class TrafficAnalysisApp:
                     tracks = self.tracker.update(bboxes)
                     frame_with_tracks = self.tracker.draw_tracks(frame_with_detections.copy(), tracks)
 
+                    for track in tracks:
+                        track_id = track['track_id']
+                        bbox = track['bbox']
+                        frame_idx = self.current_frame
+                        if track_id not in self.track_history:
+                            self.track_history[track_id] = []
+                        self.track_history[track_id].append({'bbox': bbox, 'time': frame_idx})
+                        # Giới hạn lịch sử 30 frame
+                        if len(self.track_history[track_id]) > 30:
+                            self.track_history[track_id].pop(0)
+
+                        # Tính vận tốc nếu có IPM
+                        if self.ipm is not None:
+                            speed = self.ipm.compute_speed(self.track_history[track_id], self.fps_original)
+                            if speed is not None:
+                                if track_id not in self.speed_history:
+                                    self.speed_history[track_id] = []
+                                self.speed_history[track_id].append(speed)
+                                if len(self.speed_history[track_id]) > 30:
+                                    self.speed_history[track_id].pop(0)
+                                track['speed'] = speed
+                                track['speed_history'] = self.speed_history[track_id]
+
                     # === BƯỚC 4: PHÂN TÍCH TƯ THẾ ===
                     person_detections = [d for d in detections if d['class_name'] == 'nguoi']
                     abnormal_poses = []
                     if person_detections:
                         abnormal_poses, frame_with_tracks = self.pose_analyzer.analyze(frame_with_tracks, person_detections)
+                        self.pose_results_per_track.clear()
+                        for pose in abnormal_poses:
+                            # Tìm track phù hợp nhất dựa trên IoU
+                            best_iou = 0
+                            best_track = None
+                            for track in tracks:
+                                iou_val = iou(pose['bbox'], track['bbox'])
+                                if iou_val > best_iou:
+                                    best_iou = iou_val
+                                    best_track = track
+                            if best_track and best_iou > 0.5:
+                                self.pose_results_per_track[best_track['track_id']] = pose
 
                     # === BƯỚC 5: PHÂN TÍCH MẶT ĐƯỜNG CHI TIẾT (loại trừ xe) ===
                     # Lấy vùng lòng đường để phân tích
@@ -386,7 +537,13 @@ class TrafficAnalysisApp:
                     road_result.update(detailed_road_result)
 
                     # === BƯỚC 6: PHÁT HIỆN VI PHẠM ===
-                    violations = self.violation_detector.detect(frame_with_tracks, detections, tracks)
+                    violations = self.violation_detector.detect(
+                        frame_with_tracks,
+                        detections,
+                        tracks,
+                        ipm=self.ipm,
+                        pose_results=self.pose_results_per_track
+                    )
 
                     # Log violations mới
                     for v in violations:
@@ -432,11 +589,11 @@ class TrafficAnalysisApp:
                     if self.result_queue.qsize() < 5:
                         self.result_queue.put(frame_with_tracks)
 
-                except Exception as e:
-                    print(f"Lỗi trong analysis_loop: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    self.log(f"❌ Lỗi: {str(e)}")
+                #except Exception as e:
+                  #  print(f"Lỗi trong analysis_loop: {e}")
+                    #import traceback
+                  #  traceback.print_exc()
+                   # self.log(f"❌ Lỗi: {str(e)}")
 
     def update_ui(self):
         """Cập nhật giao diện"""
@@ -524,7 +681,10 @@ THỐNG KÊ GIAO THÔNG - {datetime.now().strftime('%H:%M:%S')}
   • Trạng thái      : {"Đang chạy" if self.is_running else "Dừng"}
   • Tạm dừng        : {"Có" if self.is_paused else "Không"}
 {'='*70}
-        """
+  • Phương pháp đường: {'YOLOv8-Seg' if self.use_yolov8_seg else 'OpenCV'}
+  • TensorRT: {'Bật' if self.use_tensorrt else 'Tắt'}
+  • IPM: {'Có' if self.ipm else 'Chưa'}
+"""
         self.stats_text.delete(1.0, tk.END)
         self.stats_text.insert(tk.END, stats_text)
 

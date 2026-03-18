@@ -49,3 +49,15 @@ def save_frame(frame, prefix='capture'):
     filename = f"captures/{prefix}_{timestamp}.jpg"
     cv2.imwrite(filename, frame)
     return filename
+
+def iou(bbox1, bbox2):
+    """Tính Intersection over Union giữa hai bounding box [x1,y1,x2,y2]"""
+    x1 = max(bbox1[0], bbox2[0])
+    y1 = max(bbox1[1], bbox2[1])
+    x2 = min(bbox1[2], bbox2[2])
+    y2 = min(bbox1[3], bbox2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+    area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0
