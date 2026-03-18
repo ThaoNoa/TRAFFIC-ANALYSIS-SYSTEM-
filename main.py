@@ -15,11 +15,11 @@ from datetime import datetime
 import os
 import sys
 import numpy as np
-
 # Thêm thư mục hiện tại vào path để import modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 # Import modules
+from modules.road_analysis import RoadAnalyzer
 from modules.detection import VehicleDetector
 from modules.tracking import SimpleTracker
 from modules.road_integrator import RoadIntegrator
@@ -33,7 +33,7 @@ class TrafficAnalysisApp:
         self.root = root
         self.root.title("Hệ thống phân tích giao thông Lĩnh Nam - AI Pro")
         self.root.geometry("1600x900")
-
+        self.road_analyzer = RoadAnalyzer()
         # Khởi tạo các module
         print("=" * 70)
         print("KHỞI TẠO HỆ THỐNG PHÂN TÍCH GIAO THÔNG THÔNG MINH")
@@ -270,6 +270,16 @@ class TrafficAnalysisApp:
 
     def start_analysis(self):
         """Bắt đầu phân tích"""
+        self.stats = {
+            'total_vehicles': 0,
+            'motorcycles': 0,
+            'cars': 0,
+            'trucks': 0,
+            'buses': 0,
+            'persons': 0,
+            'bicycles': 0,
+            'violations': 0
+        }
         if not self.video_path:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn video!")
             return
@@ -309,7 +319,7 @@ class TrafficAnalysisApp:
                 ret, frame = cap.read()
                 if ret:
                     # Resize để xử lý nhanh hơn
-                    frame = cv2.resize(frame, (1024, 768))
+                    frame = cv2.resize(frame, (640, 480))
                     self.current_frame += 1
                     last_frame_time = time.time()
 
@@ -385,8 +395,11 @@ class TrafficAnalysisApp:
                             self.log(f"🚨 {v['type']} - {v['description']}")
 
                     # === BƯỚC 7: CẬP NHẬT STATS ===
-                    self.stats = self.detector.get_stats()
-                    self.stats['violations'] = len(self.violations_log)
+                    frame_stats = self.detector.get_stats()
+                    for key in frame_stats:
+                        if key in self.stats:
+                            self.stats[key] += frame_stats[key]
+                            self.stats['violations'] = len(self.violations_log)
 
                     # === BƯỚC 8: CẬP NHẬT UI TEXT ===
                     self.update_stats_text(self.stats, road_result, tracks, violations)
