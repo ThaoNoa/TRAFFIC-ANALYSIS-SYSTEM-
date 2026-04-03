@@ -21,7 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # Import modules
 from modules.road_analysis import RoadAnalyzer
 from modules.detection import VehicleDetector
-from modules.tracking import SimpleTracker
+from modules.tracking_deepsort import DeepSORTTracker
 from modules.road_integrator import RoadIntegrator
 from modules.pose_analysis_simple import PoseAnalyzer
 from modules.violation_detector import ViolationDetector
@@ -43,8 +43,8 @@ class TrafficAnalysisApp:
             print("1. Khởi tạo VehicleDetector (YOLOv8)...")
             self.detector = VehicleDetector()
 
-            print("2. Khởi tạo SimpleTracker...")
-            self.tracker = SimpleTracker()
+            print("2. Khởi tạo DeepSORTTracker...")
+            self.tracker = DeepSORTTracker()
 
             print("3. Khởi tạo RoadIntegrator...")
             self.road_integrator = RoadIntegrator()
@@ -357,7 +357,7 @@ class TrafficAnalysisApp:
 
                     # === BƯỚC 3: THEO DÕI ĐỐI TƯỢNG ===
                     bboxes = [d['bbox'] for d in detections]
-                    tracks = self.tracker.update(bboxes)
+                    tracks = self.tracker.update(bboxes, frame_with_detections)
                     frame_with_tracks = self.tracker.draw_tracks(frame_with_detections.copy(), tracks)
 
                     # === BƯỚC 4: PHÂN TÍCH TƯ THẾ ===
