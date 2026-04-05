@@ -41,6 +41,7 @@ class IPMTransformer:
         self.camera_pitch = np.radians(camera_pitch)
         self.camera_fov = np.radians(camera_fov)
         self.road_width_meters = road_width_meters
+        self.road_length_meters = 30.0
 
         # Tính toán ma trận chuyển đổi
         self._compute_transform_matrices()
@@ -48,32 +49,66 @@ class IPMTransformer:
         logger.info(f"IPMTransformer initialized - height={camera_height}m, pitch={camera_pitch}°")
 
     def _compute_transform_matrices(self):
-        """Tính ma trận chuyển đổi IPM"""
-        # Điểm nguồn (4 góc vùng quan tâm trong ảnh)
+        """Tính ma trận chuyển đổi IPM (mặc định theo kích thước frame)."""
+        road_length_meters = self.road_length_meters
         src_points = np.float32([
-            [self.frame_width * 0.2, self.frame_height * 0.6],  # Trên-trái
-            [self.frame_width * 0.8, self.frame_height * 0.6],  # Trên-phải
-            [self.frame_width * 0.95, self.frame_height],  # Dưới-phải
-            [self.frame_width * 0.05, self.frame_height]  # Dưới-trái
+            [self.frame_width * 0.2, self.frame_height * 0.6],
+            [self.frame_width * 0.8, self.frame_height * 0.6],
+            [self.frame_width * 0.95, self.frame_height],
+            [self.frame_width * 0.05, self.frame_height]
         ])
-
-        # Điểm đích (trong mặt phẳng đường, đơn vị mét)
-        # Giả sử vùng quan tâm dài 30m, rộng bằng đường
-        road_length_meters = 30.0
         dst_points = np.float32([
             [0, 0],
             [self.road_width_meters, 0],
             [self.road_width_meters, road_length_meters],
             [0, road_length_meters]
         ])
-
-        # Tính ma trận perspective transform
         self.M = cv2.getPerspectiveTransform(src_points, dst_points)
         self.M_inv = cv2.getPerspectiveTransform(dst_points, src_points)
-
-        # Tỷ lệ pixel/mét
         self.pixels_per_meter_x = self.frame_width / self.road_width_meters
         self.pixels_per_meter_y = self.frame_height / road_length_meters
+
+    def set_frame_size(self, frame_width, frame_height):
+        """Đồng bộ IPM với kích thước frame thực tế (ví dụ 640x480)."""
+        self.frame_width = int(frame_width)
+        self.frame_height = int(frame_height)
+        self._compute_transform_matrices()
+
+    def set_calibration_from_roi(self, y1, y2, x1, x2, frame_h, frame_w,
+                                 road_length_meters=None):
+        """
+        Hiệu chỉnh homography theo ROI lòng đường (đã làm mượt) để IPM bám mặt đường ổn định hơn.
+        roi_coords format: [y1, y2, x1, x2]
+        """
+        if road_length_meters is not None:
+            self.road_length_meters = float(road_length_meters)
+        fw, fh = int(frame_w), int(frame_h)
+        x1 = int(np.clip(x1, 0, fw - 1))
+        x2 = int(np.clip(x2, 0, fw - 1))
+        y1 = int(np.clip(y1, 0, fh - 1))
+        y2 = int(np.clip(y2, 0, fh - 1))
+        if x2 <= x1 + 4 or y2 <= y1 + 4:
+            return
+        rw = float(x2 - x1)
+        rh = float(y2 - y1)
+        src_points = np.float32([
+            [x1 + 0.08 * rw, y1 + 0.22 * rh],
+            [x2 - 0.08 * rw, y1 + 0.22 * rh],
+            [x2 - 0.02 * rw, y2],
+            [x1 + 0.02 * rw, y2],
+        ])
+        L = self.road_length_meters
+        W = self.road_width_meters
+        dst_points = np.float32([
+            [0, 0],
+            [W, 0],
+            [W, L],
+            [0, L]
+        ])
+        self.M = cv2.getPerspectiveTransform(src_points, dst_points)
+        self.M_inv = cv2.getPerspectiveTransform(dst_points, src_points)
+        self.pixels_per_meter_x = fw / max(W, 1e-6)
+        self.pixels_per_meter_y = fh / max(L, 1e-6)
 
     def image_to_road(self, x, y):
         """
@@ -174,17 +209,14 @@ class IPMTransformer:
             [w * 0.05, h]
         ])
 
-        # Kích thước ảnh BEV
-        bev_width = int(self.road_width_meters * self.pixels_per_meter_x)
-        bev_height = 600
-
+        bev_width = max(160, int(self.road_width_meters * 25))
+        bev_height = max(200, int(self.road_length_meters * 25))
         dst_points = np.float32([
             [0, 0],
             [bev_width, 0],
             [bev_width, bev_height],
             [0, bev_height]
         ])
-
         M_bev = cv2.getPerspectiveTransform(src_points, dst_points)
         bev = cv2.warpPerspective(frame, M_bev, (bev_width, bev_height))
 
@@ -193,76 +225,105 @@ class IPMTransformer:
 
 class VehicleTrackerWithIPM:
     """
-    Kết hợp tracking và IPM để tính vận tốc, gia tốc
+    Kết hợp tracking và IPM để tính vận tốc, gia tốc (theo từng track_id).
+    Dùng điểm chân (foot: giữa đáy bbox) trên mặt phẳng ảnh — ổn định hơn cho IPM.
     """
 
-    def __init__(self, ipm_transformer):
+    def __init__(self, ipm_transformer, history_max=25, speed_ema_alpha=0.22,
+                 max_speed_kmh=160.0, min_dt=1.0 / 120.0):
         self.ipm = ipm_transformer
-        self.vehicle_history = {}  # track_id -> list of (timestamp, position, velocity)
+        self.vehicle_history = {}
+        self._speed_ema_kmh = {}
+        self.history_max = history_max
+        self.speed_ema_alpha = speed_ema_alpha
+        self.max_speed_kmh = max_speed_kmh
+        self.min_dt = min_dt
 
-    def update_vehicle(self, track_id, center, timestamp):
+    def update_vehicle(self, track_id, foot_xy, timestamp):
         """
-        Cập nhật vị trí phương tiện và tính toán động học
-
         Args:
-            track_id: ID của phương tiện
-            center: Tâm bounding box (x, y) trong ảnh
-            timestamp: Thời gian (giây)
+            track_id: ID track
+            foot_xy: (x, y) điểm giữa cạnh dưới bbox (tiếp xúc “mặt đường” trên ảnh)
+            timestamp: time.time() (giây)
 
         Returns:
-            velocity_kmh: Vận tốc (km/h)
-            acceleration: Gia tốc (m/s²)
+            (velocity_kmh_smoothed, acceleration_m_s2)
         """
-        # Chuyển sang tọa độ thực tế
-        road_x, road_y = self.ipm.image_to_road(center[0], center[1])
+        road_x, road_y = self.ipm.image_to_road(foot_xy[0], foot_xy[1])
 
-        # Khởi tạo lịch sử nếu chưa có
         if track_id not in self.vehicle_history:
             self.vehicle_history[track_id] = []
 
         history = self.vehicle_history[track_id]
         history.append({
             'timestamp': timestamp,
-            'center_pixel': center,
+            'center_pixel': (float(foot_xy[0]), float(foot_xy[1])),
             'center_road': (road_x, road_y),
-            'velocity': 0,
-            'acceleration': 0
+            'velocity': 0.0,
+            'acceleration': 0.0
         })
 
-        # Giữ tối đa 30 frame lịch sử
-        if len(history) > 30:
+        if len(history) > self.history_max:
             history.pop(0)
 
-        # Tính vận tốc và gia tốc nếu có đủ dữ liệu
-        velocity_kmh = 0
-        acceleration = 0
+        velocity_kmh_instant = 0.0
+        acceleration = 0.0
+        velocity_ms = 0.0
 
         if len(history) >= 2:
             prev = history[-2]
             curr = history[-1]
             time_delta = curr['timestamp'] - prev['timestamp']
+            if time_delta < self.min_dt:
+                time_delta = self.min_dt
 
-            # Tính vận tốc
-            velocity_kmh, velocity_ms = self.ipm.compute_velocity(
+            velocity_kmh_instant, velocity_ms = self.ipm.compute_velocity(
                 prev['center_pixel'], curr['center_pixel'], time_delta
             )
+            if not np.isfinite(velocity_kmh_instant):
+                velocity_kmh_instant = 0.0
+                velocity_ms = 0.0
+            velocity_kmh_instant = float(np.clip(velocity_kmh_instant, 0.0, self.max_speed_kmh))
             history[-1]['velocity'] = velocity_ms
 
-            # Tính gia tốc
             if len(history) >= 3:
                 prev_vel = history[-2]['velocity']
                 curr_vel = history[-1]['velocity']
-                acceleration = self.ipm.compute_acceleration(prev_vel, curr_vel, time_delta)
+                acceleration = self.ipm.compute_acceleration(
+                    prev_vel, curr_vel, time_delta
+                )
                 history[-1]['acceleration'] = acceleration
 
-        return velocity_kmh, acceleration
+        # Làm mượt vận tốc hiển thị theo từng track_id
+        if track_id not in self._speed_ema_kmh:
+            self._speed_ema_kmh[track_id] = velocity_kmh_instant
+        else:
+            a = self.speed_ema_alpha
+            self._speed_ema_kmh[track_id] = (
+                a * velocity_kmh_instant + (1.0 - a) * self._speed_ema_kmh[track_id]
+            )
+        velocity_kmh_smoothed = float(np.clip(self._speed_ema_kmh[track_id], 0.0, self.max_speed_kmh))
+
+        return velocity_kmh_smoothed, acceleration
+
+    def prune(self, active_track_ids):
+        """Xóa lịch sử track không còn xuất hiện (tránh rò bộ nhớ / ID cũ)."""
+        active = set(active_track_ids)
+        for tid in list(self.vehicle_history.keys()):
+            if tid not in active:
+                del self.vehicle_history[tid]
+        for tid in list(self._speed_ema_kmh.keys()):
+            if tid not in active:
+                del self._speed_ema_kmh[tid]
+
+    def reset(self):
+        """Xóa toàn bộ lịch sử (khi mở video / phân tích mới)."""
+        self.vehicle_history.clear()
+        self._speed_ema_kmh.clear()
 
     def get_speed(self, track_id):
-        """Lấy vận tốc hiện tại của phương tiện (km/h)"""
-        if track_id in self.vehicle_history and self.vehicle_history[track_id]:
-            last = self.vehicle_history[track_id][-1]
-            return last['velocity'] * 3.6  # m/s -> km/h
-        return 0
+        """Vận tốc làm mượt (km/h) cho track_id."""
+        return float(self._speed_ema_kmh.get(track_id, 0.0))
 
     def is_speeding(self, track_id, speed_limit_kmh=60):
         """Kiểm tra có đang vượt quá tốc độ không"""

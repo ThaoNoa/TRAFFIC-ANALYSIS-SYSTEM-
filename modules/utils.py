@@ -6,6 +6,38 @@ import cv2
 import os
 from datetime import datetime
 
+
+def bbox_iou(box_a, box_b):
+    """IoU giữa hai bbox [x1,y1,x2,y2]."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    a1 = max(0, box_a[2] - box_a[0]) * max(0, box_a[3] - box_a[1])
+    a2 = max(0, box_b[2] - box_b[0]) * max(0, box_b[3] - box_b[1])
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
+
+def best_detection_for_track(track_bbox, detections, iou_threshold=0.08):
+    """
+    Ghép track → detection chỉ bằng IoU (cao nhất).
+    Không dùng fallback khoảng cách — tránh gán nhầm + box rỗng vẫn bị tính vận tốc.
+    """
+    if not detections:
+        return None
+    best = None
+    best_iou = 0.0
+    for det in detections:
+        iou = bbox_iou(track_bbox, det['bbox'])
+        if iou > best_iou:
+            best_iou = iou
+            best = det
+    if best is not None and best_iou >= iou_threshold:
+        return best
+    return None
+
 def draw_info_panel(frame, stats, fps):
     """Vẽ bảng thông tin mở rộng"""
     h, w = frame.shape[:2]

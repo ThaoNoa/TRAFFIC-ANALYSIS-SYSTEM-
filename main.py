@@ -25,7 +25,13 @@ from modules.tracking_deepsort import DeepSORTTracker
 from modules.road_integrator import RoadIntegrator
 from modules.pose_analysis_simple import PoseAnalyzer
 from modules.violation_detector import ViolationDetector
-from modules.utils import draw_info_panel, draw_timestamp, save_frame
+from modules.utils import (
+    draw_info_panel,
+    draw_timestamp,
+    save_frame,
+    best_detection_for_track,
+)
+from modules.ipm import IPMTransformer, VehicleTrackerWithIPM
 
 
 class TrafficAnalysisApp:
@@ -54,6 +60,10 @@ class TrafficAnalysisApp:
 
             print("5. Khởi tạo ViolationDetector...")
             self.violation_detector = ViolationDetector()
+
+            print("6. Khởi tạo IPM + tốc độ theo track...")
+            self.ipm = IPMTransformer(frame_width=640, frame_height=480)
+            self.speed_tracker = VehicleTrackerWithIPM(self.ipm)
 
             print("✅ Đã khởi tạo xong tất cả modules!")
         except Exception as e:
@@ -96,6 +106,9 @@ class TrafficAnalysisApp:
             'bicycles': 0,
             'violations': 0
         }
+        self._vehicle_classes_speed = frozenset({
+            'xe_may', 'xe_oto', 'xe_bus', 'xe_tai', 'xe_dap'
+        })
 
         # Log violations
         self.violations_log = []
@@ -287,6 +300,9 @@ class TrafficAnalysisApp:
         if not self.is_running:
             self.is_running = True
             self.is_paused = False
+            self.road_integrator.reset_roi_smoothing()
+            self.speed_tracker.reset()
+            self.tracker.reset_bbox_smoothing()
             self.status_bar.config(text="Đang phân tích...")
             self.log("▶ Bắt đầu phân tích")
 
@@ -349,16 +365,70 @@ class TrafficAnalysisApp:
                     road_result, frame_with_road = self.road_integrator.process(frame)
                     road_mask = road_result.get('road_mask')
 
+                    fh, fw = frame.shape[:2]
+                    ry1, ry2, rx1, rx2 = road_result.get(
+                        'roi_coords', [0, fh, 0, fw]
+                    )
+                    self.ipm.set_calibration_from_roi(ry1, ry2, rx1, rx2, fh, fw)
+
                     # === BƯỚC 2: PHÁT HIỆN PHƯƠNG TIỆN (YOLOv8) ===
                     # Yêu cầu trả về vehicle mask để loại trừ khỏi phân tích hư hỏng
                     detections, frame_with_detections, vehicle_mask = self.detector.detect(
-                        frame_with_road, road_mask, return_vehicle_mask=True
+                        frame_with_road,
+                        road_mask,
+                        return_vehicle_mask=True,
+                        roi_coords=road_result.get('roi_coords'),
                     )
 
-                    # === BƯỚC 3: THEO DÕI ĐỐI TƯỢNG ===
+                    # === BƯỚC 3: THEO DÕI ĐỐI TƯỢNG + IPM vận tốc (theo track_id, chỉ phương tiện) ===
                     bboxes = [d['bbox'] for d in detections]
-                    tracks = self.tracker.update(bboxes, frame_with_detections)
-                    frame_with_tracks = self.tracker.draw_tracks(frame_with_detections.copy(), tracks)
+                    det_confs = [float(d.get('confidence', 1.0)) for d in detections]
+                    tracks_all = self.tracker.update(
+                        bboxes, frame_with_detections, detections_confs=det_confs
+                    )
+                    # Hiển thị: tsu<=1 (vừa khớp hoặc 1 frame dự đoán) — tránh nhấp nháy 1 tick
+                    # Tính vận tốc IPM: chỉ khi tsu==0 (có đo đáy thật frame này)
+                    tsu_vis_max = 1
+                    tracks = [
+                        t for t in tracks_all
+                        if t.get('time_since_update', 99) <= tsu_vis_max
+                    ]
+                    now_ts = time.time()
+                    active_track_ids = {t['track_id'] for t in tracks}
+                    for tr in tracks:
+                        tid = tr['track_id']
+                        tsu = tr.get('time_since_update', 0)
+                        iou_th = 0.055 if tsu > 0 else 0.075
+                        matched = best_detection_for_track(
+                            tr['bbox'], detections, iou_threshold=iou_th
+                        )
+                        if (
+                            tsu == 0
+                            and matched
+                            and matched.get('class_name') in self._vehicle_classes_speed
+                        ):
+                            x1, y1, x2, y2 = tr['bbox']
+                            foot = ((x1 + x2) // 2, y2)
+                            v_kmh, _acc = self.speed_tracker.update_vehicle(
+                                tid, foot, now_ts
+                            )
+                            tr['speed_kmh'] = v_kmh
+                            tr['class_name'] = matched['class_name']
+                        elif matched and matched.get('class_name') in self._vehicle_classes_speed:
+                            tr['class_name'] = matched['class_name']
+                            tr['speed_kmh'] = self.speed_tracker.get_speed(tid)
+                        else:
+                            hold = self.speed_tracker.get_speed(tid)
+                            if tsu <= tsu_vis_max and hold > 0.05:
+                                tr['speed_kmh'] = hold
+                            else:
+                                tr['speed_kmh'] = None
+
+                    self.speed_tracker.prune(active_track_ids)
+
+                    frame_with_tracks = self.tracker.draw_tracks(
+                        frame_with_detections.copy(), tracks
+                    )
 
                     # === BƯỚC 4: PHÂN TÍCH TƯ THẾ ===
                     person_detections = [d for d in detections if d['class_name'] == 'nguoi']
@@ -476,9 +546,16 @@ class TrafficAnalysisApp:
         """Cập nhật text thống kê"""
         y1, y2, x1, x2 = road_result.get('roi_coords', [0, 0, 0, 0])
 
-        # Thống kê tracks
+        # Thống kê tracks + vận tốc (IPM, km/h) — chỉ hiển thị khi track là phương tiện khớp detection
         active_tracks = len(tracks)
         track_ids = [t['track_id'] for t in tracks][:10]
+        speed_lines = []
+        for t in tracks[:12]:
+            tid = t['track_id']
+            spd = t.get('speed_kmh')
+            if spd is not None:
+                speed_lines.append(f"ID{tid}={spd:.1f}km/h")
+        speed_summary = ", ".join(speed_lines) if speed_lines else "(chưa có / không phải xe)"
 
         stats_text = f"""
 {'='*70}
@@ -497,6 +574,7 @@ THỐNG KÊ GIAO THÔNG - {datetime.now().strftime('%H:%M:%S')}
 🎯 THEO DÕI:
   • Đối tượng     : {active_tracks}
   • Track IDs     : {track_ids}
+  • Vận tốc (IPM) : {speed_summary}
 
 🚨 VI PHẠM:
   • Tổng số       : {stats['violations']}

@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class VehicleDetector:
     def __init__(self,
                  model_path='yolov8n.pt',
-                 conf_threshold=0.35,
+                 conf_threshold=0.30,
                  iou_threshold=0.5,
                  device='cuda' if torch.cuda.is_available() else 'cpu',
                  use_tensorrt=False,
@@ -64,14 +64,86 @@ class VehicleDetector:
 
         logger.info(f"VehicleDetector initialized - conf={conf_threshold}, iou={iou_threshold}")
 
+    def _is_on_road(
+        self,
+        bbox: List[int],
+        class_name: str,
+        road_mask: Optional[np.ndarray],
+        roi_coords: List[int],
+        w: int,
+        h: int,
+    ) -> bool:
+        """
+        Người: giữ kiểm tra chặt (điểm trên mask đường).
+        Phương tiện: mask đường thường không phủ pixel thân xe — kiểm tra dải đáy bbox,
+        mask nở nhẹ, và chồng lấn với ROI lòng đường để không mất ô tô/xe tải.
+        """
+        if road_mask is None:
+            return True
+        x1, y1, x2, y2 = bbox
+        x1 = max(0, min(x1, w - 1))
+        x2 = max(0, min(x2, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        y2 = max(0, min(y2, h - 1))
+        if x2 <= x1 or y2 <= y1:
+            return False
+
+        ry1, ry2, rx1, rx2 = roi_coords
+        ry1 = max(0, min(ry1, h - 1))
+        ry2 = max(0, min(ry2, h))
+        rx1 = max(0, min(rx1, w - 1))
+        rx2 = max(0, min(rx2, w - 1))
+
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        bottom_y = y2
+
+        def pixel_road(mask, px, py):
+            if 0 <= px < w and 0 <= py < h:
+                return mask[py, px] > 0
+            return False
+
+        if class_name == 'nguoi':
+            if pixel_road(road_mask, center_x, center_y):
+                return True
+            if pixel_road(road_mask, center_x, bottom_y):
+                return True
+            return False
+
+        relaxed = cv2.dilate(road_mask, np.ones((5, 5), np.uint8), iterations=2)
+        cx = (x1 + x2) // 2
+        for y in range(y2, max(y1, y2 - 20), -1):
+            for dx in range(-min(35, (x2 - x1) // 2), min(35, (x2 - x1) // 2) + 1, 7):
+                px = int(np.clip(cx + dx, 0, w - 1))
+                if pixel_road(relaxed, px, y):
+                    return True
+
+        foot_x, foot_y = cx, y2
+        if rx1 <= foot_x <= rx2 and ry1 <= foot_y <= ry2:
+            return True
+
+        ix1, iy1 = max(x1, rx1), max(y1, ry1)
+        ix2, iy2 = min(x2, rx2), min(y2, ry2)
+        if ix2 > ix1 and iy2 > iy1:
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            box_area = max(1, (x2 - x1) * (y2 - y1))
+            if inter / box_area >= 0.12:
+                return True
+
+        return False
+
     def detect(self,
                frame: np.ndarray,
                road_mask: Optional[np.ndarray] = None,
-               return_vehicle_mask: bool = False) -> Tuple[List[Dict], np.ndarray, Optional[np.ndarray]]:
+               return_vehicle_mask: bool = False,
+               roi_coords: Optional[List[int]] = None) -> Tuple[List[Dict], np.ndarray, Optional[np.ndarray]]:
         """
-        Phát hiện phương tiện
+        Phát hiện phương tiện.
+        roi_coords: [y1, y2, x1, x2] vùng lòng đường — dùng khi lọc phương tiện với mask.
         """
         h, w = frame.shape[:2]
+        if roi_coords is None:
+            roi_coords = [0, h, 0, w]
 
         # Chạy YOLO
         results = self.model(frame,
@@ -112,19 +184,9 @@ class VehicleDetector:
                     if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
                         continue
 
-                    on_road = True
-                    if road_mask is not None:
-                        center_x = (x1 + x2) // 2
-                        center_y = (y1 + y2) // 2
-                        bottom_y = y2
-
-                        on_road = False
-                        if (0 <= center_x < w and 0 <= center_y < h and
-                            road_mask[center_y, center_x] > 0):
-                            on_road = True
-                        elif (0 <= center_x < w and 0 <= bottom_y < h and
-                              road_mask[bottom_y, center_x] > 0):
-                            on_road = True
+                    on_road = self._is_on_road(
+                        [x1, y1, x2, y2], class_name, road_mask, roi_coords, w, h
+                    )
 
                     if on_road:
                         detection = {

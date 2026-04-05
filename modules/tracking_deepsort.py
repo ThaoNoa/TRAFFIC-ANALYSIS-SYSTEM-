@@ -7,12 +7,38 @@ import numpy as np
 import cv2
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
+def _clamp_bbox_xyxy(x1, y1, x2, y2, fw, fh):
+    """Giữ bbox trong ảnh và tránh box phình to bất thường (Kalman trôi)."""
+    x1 = float(np.clip(x1, 0, max(0, fw - 1)))
+    x2 = float(np.clip(x2, 0, fw))
+    y1 = float(np.clip(y1, 0, max(0, fh - 1)))
+    y2 = float(np.clip(y2, 0, fh))
+    if x2 <= x1 + 1:
+        x2 = min(fw, x1 + 2)
+    if y2 <= y1 + 1:
+        y2 = min(fh, y1 + 2)
+    bw, bh = x2 - x1, y2 - y1
+    max_w, max_h = 0.55 * fw, 0.55 * fh
+    if bw > max_w:
+        cx = (x1 + x2) * 0.5
+        half = max_w * 0.5
+        x1 = max(0.0, cx - half)
+        x2 = min(float(fw), cx + half)
+    if bh > max_h:
+        cy = (y1 + y2) * 0.5
+        half = max_h * 0.5
+        y1 = max(0.0, cy - half)
+        y2 = min(float(fh), cy + half)
+    return int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+
+
 class DeepSORTTracker:
     def __init__(self,
-                 max_age=30,           # Thời gian giữ track khi mất dấu (frames)
-                 n_init=3,             # Số frame cần để khởi tạo track
+                 max_age=12,           # Đủ để gánh 1–2 frame mất khớp, vẫn không “ma” lâu
+                 n_init=1,             # Xác nhận ngay frame đầu có detection → box sớm
                  nn_budget=100,        # Số đặc trưng lưu trữ tối đa mỗi track
-                 max_cosine_distance=0.3):  # Ngưỡng cosine distance (λ=0.7 tương đương)
+                 max_cosine_distance=0.3,  # Ngưỡng cosine distance (λ=0.7 tương đương)
+                 bbox_smooth_alpha=0.22):
         """
         Khởi tạo DeepSORT tracker với tham số tối ưu cho xe máy tại Lĩnh Nam
 
@@ -36,7 +62,12 @@ class DeepSORTTracker:
             half=True,  # FP16 để tăng tốc
             bgr=True
         )
+        self.bbox_smooth_alpha = bbox_smooth_alpha
+        self._bbox_ema = {}
         print("DeepSORT Tracker initialized - λ=0.7 optimized for Lĩnh Nam motorcycles")
+
+    def reset_bbox_smoothing(self):
+        self._bbox_ema.clear()
 
     def update(self, detections_bbox, frame, detections_classes=None, detections_confs=None):
         """
@@ -66,29 +97,58 @@ class DeepSORTTracker:
 
         # Cập nhật tracker
         tracks = self.tracker.update_tracks(deepsort_detections, frame=frame)
+        fh, fw = frame.shape[:2]
 
         # Chuyển đổi kết quả về dạng dễ sử dụng
+        # n_init=1: hầu hết đã confirmed sớm; vẫn xuất track tentative vừa khớp frame này (tsu==0)
+        # để box xuất hiện cùng lúc YOLO thấy xe, không chờ thêm frame.
         results = []
         for track in tracks:
-            if not track.is_confirmed():
+            tsu = track.time_since_update
+            if not track.is_confirmed() and tsu != 0:
                 continue
 
             track_id = track.track_id
             ltrb = track.to_ltrb()  # [left, top, right, bottom]
+            raw = np.array([ltrb[0], ltrb[1], ltrb[2], ltrb[3]], dtype=np.float32)
+            time_since_update = track.time_since_update
+
+            # Chỉ làm mượt khi vừa khớp detection (tsu==0). Khi coasting, Kalman hay “bay” —
+            # không trộn EMA để tránh box rỗng phóng to.
+            if time_since_update == 0:
+                if track_id in self._bbox_ema:
+                    a = self.bbox_smooth_alpha
+                    bbox = a * raw + (1.0 - a) * self._bbox_ema[track_id]
+                else:
+                    bbox = raw.copy()
+                self._bbox_ema[track_id] = bbox
+            else:
+                bbox = raw
+                if track_id in self._bbox_ema:
+                    del self._bbox_ema[track_id]
+
+            x1, y1, x2, y2 = _clamp_bbox_xyxy(
+                bbox[0], bbox[1], bbox[2], bbox[3], fw, fh
+            )
 
             # Lấy thông tin thêm
             age = track.age
             hits = track.hits
-            time_since_update = track.time_since_update
 
             results.append({
                 'track_id': track_id,
-                'bbox': [int(ltrb[0]), int(ltrb[1]), int(ltrb[2]), int(ltrb[3])],
+                'bbox': [x1, y1, x2, y2],
                 'age': age,
                 'hits': hits,
                 'time_since_update': time_since_update,
+                'confirmed': track.is_confirmed(),
                 'color': self._generate_color(track_id)
             })
+
+        active = {r['track_id'] for r in results}
+        for tid in list(self._bbox_ema.keys()):
+            if tid not in active:
+                del self._bbox_ema[tid]
 
         return results
 
@@ -115,6 +175,9 @@ class DeepSORTTracker:
         annotated = frame.copy()
 
         for track in tracks:
+            # Hiển thị cả 1 frame “dự đoán” sau khi mất khớp tạm thời — tránh nhấp nháy 1 tick
+            if track.get('time_since_update', 99) > 1:
+                continue
             x1, y1, x2, y2 = track['bbox']
             track_id = track['track_id']
             color = track['color']
@@ -122,10 +185,15 @@ class DeepSORTTracker:
             # Vẽ bounding box
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
-            # Vẽ label với track ID và hits
             label = f"ID:{track_id}"
             if track.get('hits', 0) > 0:
                 label += f"({track['hits']})"
+            spd = track.get('speed_kmh')
+            if spd is not None:
+                label += f" {spd:.0f}km/h"
+            cn = track.get('class_name')
+            if cn and spd is not None:
+                label += f" [{cn}]"
 
             cv2.putText(annotated, label, (x1, y1-5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)

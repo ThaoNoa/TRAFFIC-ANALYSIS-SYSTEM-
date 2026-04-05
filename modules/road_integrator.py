@@ -19,10 +19,16 @@ class RoadIntegrator:
     B3: Visualization - vẽ kết quả
     """
 
-    def __init__(self):
+    def __init__(self, roi_smooth_alpha=0.22):
         self.segmentation = RoadSegmentation()
         self.analyzer = RoadAnalyzer()
+        self.roi_smooth_alpha = roi_smooth_alpha
+        self._roi_ema = None
         logger.info("RoadIntegrator initialized")
+
+    def reset_roi_smoothing(self):
+        """Đặt lại làm mượt ROI khi bắt đầu video mới."""
+        self._roi_ema = None
 
     def process(self, frame):
         """
@@ -40,8 +46,33 @@ class RoadIntegrator:
         # BƯỚC 1: TÁCH LÒNG ĐƯỜNG VÀ VỈA HÈ
         road_mask, sidewalk_mask, roi_coords, seg_info = self.segmentation.extract_road_and_sidewalk(frame)
 
-        # BƯỚC 2: LẤY VÙNG LÒNG ĐƯỜNG
+        # Làm mượt bbox/ROI mặt đường theo thời gian (giảm giật segmentation)
         y1, y2, x1, x2 = roi_coords
+        if self._roi_ema is None:
+            self._roi_ema = [float(y1), float(y2), float(x1), float(x2)]
+        else:
+            a = self.roi_smooth_alpha
+            self._roi_ema[0] = a * y1 + (1.0 - a) * self._roi_ema[0]
+            self._roi_ema[1] = a * y2 + (1.0 - a) * self._roi_ema[1]
+            self._roi_ema[2] = a * x1 + (1.0 - a) * self._roi_ema[2]
+            self._roi_ema[3] = a * x2 + (1.0 - a) * self._roi_ema[3]
+        roi_coords = [
+            int(round(self._roi_ema[0])),
+            int(round(self._roi_ema[1])),
+            int(round(self._roi_ema[2])),
+            int(round(self._roi_ema[3])),
+        ]
+        roi_coords[0] = max(0, min(roi_coords[0], h - 1))
+        roi_coords[1] = max(0, min(roi_coords[1], h))
+        roi_coords[2] = max(0, min(roi_coords[2], w - 1))
+        roi_coords[3] = max(0, min(roi_coords[3], w))
+        if roi_coords[1] <= roi_coords[0]:
+            roi_coords[1] = min(h, roi_coords[0] + 1)
+        if roi_coords[3] <= roi_coords[2]:
+            roi_coords[3] = min(w, roi_coords[2] + 1)
+        y1, y2, x1, x2 = roi_coords
+
+        # BƯỚC 2: LẤY VÙNG LÒNG ĐƯỜNG
         road_region = self.segmentation.get_road_region(frame, road_mask, roi_coords)
 
         # BƯỚC 3: PHÂN TÍCH LÒNG ĐƯỜNG
