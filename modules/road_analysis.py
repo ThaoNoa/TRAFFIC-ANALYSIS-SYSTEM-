@@ -21,11 +21,16 @@ class RoadAnalyzer:
         # Ngưỡng phát hiện
         self.pothole_threshold = 0.08
         self.crack_threshold = 0.12
-        self.water_threshold = 0.1  # Ngưỡng phát hiện vũng nước
+        self.water_threshold = 0.1
+        self.obstacle_threshold = 0.05  # Ngưỡng cho chướng ngại vật
 
         # Kernel cho morphology
         self.kernel_small = np.ones((3, 3), np.uint8)
         self.kernel_medium = np.ones((5, 5), np.uint8)
+
+        # Đếm chướng ngại vật
+        self.obstacle_count = 0
+        self.obstacle_history = {}  # Lưu vị trí chướng ngại vật để tránh đếm trùng
 
         logger.info("RoadAnalyzer initialized")
 
@@ -49,70 +54,74 @@ class RoadAnalyzer:
 
         # Nếu có vehicle_mask, tạo mask chỉ phân tích vùng không có xe
         if vehicle_mask is not None and vehicle_mask.size > 0:
-            # Resize vehicle_mask về cùng kích thước với road_region nếu cần
             if vehicle_mask.shape[:2] != (h, w):
                 vehicle_mask = cv2.resize(vehicle_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-            # Mask phân tích: chỉ phân tích vùng không có xe
             analysis_mask = cv2.bitwise_not(vehicle_mask)
         else:
             analysis_mask = np.ones((h, w), dtype=np.uint8) * 255
 
-        # ----- 1. PHÁT HIỆN Ổ GÀ (dựa trên cạnh và vùng tối) -----
+        # ----- 1. PHÁT HIỆN Ổ GÀ -----
         edges = cv2.Canny(gray, 30, 100)
         dark_regions = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)[1]
 
-        # Chỉ phân tích trên vùng không có xe
         edges_filtered = cv2.bitwise_and(edges, edges, mask=analysis_mask)
         dark_regions_filtered = cv2.bitwise_and(dark_regions, dark_regions, mask=analysis_mask)
 
-        # Tìm contours trên edges để phát hiện ổ gà
         contours, _ = cv2.findContours(edges_filtered, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         pothole_contours = []
         crack_contours = []
         water_contours = []
+        obstacle_contours = []  # THÊM: danh sách chướng ngại vật
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 100:  # Bỏ qua các contour quá nhỏ
+            if area < 100:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
             if perimeter == 0:
                 continue
 
-            # Tính các đặc trưng hình học
             x, y, w_box, h_box = cv2.boundingRect(contour)
             aspect_ratio = w_box / h_box if h_box > 0 else 0
             circularity = 4 * np.pi * area / (perimeter * perimeter)
 
-            # Tính độ sâu (dựa trên độ tối của vùng)
             roi_dark = dark_regions_filtered[y:y+h_box, x:x+w_box]
             dark_ratio_in_contour = np.sum(roi_dark > 0) / roi_dark.size if roi_dark.size > 0 else 0
 
-            # Phân loại dựa trên hình dạng và đặc điểm
+            # === THÊM: PHÁT HIỆN CHƯỚNG NGẠI VẬT ===
+            # Chướng ngại vật = vật thể lạ trên đường (không phải ổ gà, không phải vết nứt)
+            is_obstacle = False
+
+            # Phân loại
             if 150 < area < 5000:
-                if aspect_ratio > 3 or aspect_ratio < 0.33:  # Dạng kéo dài
-                    if dark_ratio_in_contour > 0.3:  # Vết nứt thường tối
+                if aspect_ratio > 3 or aspect_ratio < 0.33:
+                    if dark_ratio_in_contour > 0.3:
                         crack_contours.append(contour)
-                elif circularity < 0.7:  # Dạng không đều
-                    if dark_ratio_in_contour > 0.4:  # Ổ gà thường tối
+                elif circularity < 0.7:
+                    if dark_ratio_in_contour > 0.4:
                         pothole_contours.append(contour)
-                    elif dark_ratio_in_contour < 0.2:  # Vũng nước thường sáng bóng
-                        # Kiểm tra độ phẳng để phân biệt vũng nước
+                    elif dark_ratio_in_contour < 0.2:
                         roi = gray[y:y+h_box, x:x+w_box]
-                        if np.std(roi) < 30:  # Vũng nước có texture đồng nhất
+                        if np.std(roi) < 30:
                             water_contours.append(contour)
+                        else:
+                            # Vật thể lạ không phải ổ gà, nước, vết nứt
+                            is_obstacle = True
+                            obstacle_contours.append(contour)
+                else:
+                    # Contour tròn nhưng không phải ổ gà -> có thể là chướng ngại vật
+                    if dark_ratio_in_contour < 0.3 and area > 300:
+                        is_obstacle = True
+                        obstacle_contours.append(contour)
 
-        # ----- 2. PHÂN TÍCH TEXTURE TỔNG THỂ -----
-        kernel = np.array([[-1, -1, -1],
-                          [-1,  8, -1],
-                          [-1, -1, -1]])
+        # Cập nhật số lượng chướng ngại vật (tránh đếm trùng)
+        self._update_obstacle_count(obstacle_contours, gray.shape)
+
+        # ----- 2. PHÂN TÍCH TEXTURE -----
+        kernel = np.array([[-1, -1, -1], [-1, 8, -1], [-1, -1, -1]])
         laplacian = cv2.filter2D(gray, cv2.CV_64F, kernel)
-        texture_score = np.std(laplacian)
-
-        # Chỉ tính trên vùng không có xe
         masked_laplacian = cv2.bitwise_and(laplacian.astype(np.uint8),
                                            laplacian.astype(np.uint8),
                                            mask=analysis_mask)
@@ -134,6 +143,7 @@ class RoadAnalyzer:
         pothole_detected = len(pothole_contours) > 0
         crack_detected = len(crack_contours) > 0
         water_detected = len(water_contours) > 0
+        obstacle_detected = len(obstacle_contours) > 0
 
         condition_parts = []
         if pothole_detected:
@@ -142,6 +152,8 @@ class RoadAnalyzer:
             condition_parts.append(f"{len(crack_contours)} vết nứt")
         if water_detected:
             condition_parts.append(f"{len(water_contours)} vũng nước")
+        if obstacle_detected:
+            condition_parts.append(f"{len(obstacle_contours)} chướng ngại vật")
 
         if condition_parts:
             condition = f"⚠️ PHÁT HIỆN: " + ", ".join(condition_parts)
@@ -160,6 +172,9 @@ class RoadAnalyzer:
             'pothole_detected': pothole_detected,
             'crack_detected': crack_detected,
             'water_detected': water_detected,
+            'obstacle_detected': obstacle_detected,  # THÊM
+            'obstacle_count': len(obstacle_contours),  # THÊM
+            'total_obstacles': self.obstacle_count,  # THÊM: tổng số chướng ngại vật đã phát hiện
             'edge_density': float(edge_density),
             'dark_ratio': float(dark_ratio),
             'texture_score': float(texture_score),
@@ -169,35 +184,52 @@ class RoadAnalyzer:
             'pothole_contours': pothole_contours,
             'crack_contours': crack_contours,
             'water_contours': water_contours,
+            'obstacle_contours': obstacle_contours,  # THÊM
             'road_area': road_region.shape[0] * road_region.shape[1],
-            'analysis_mask': analysis_mask  # Trả về để vẽ
+            'analysis_mask': analysis_mask
         }
 
         return result
+
+    def _update_obstacle_count(self, obstacle_contours, frame_shape):
+        """Cập nhật số lượng chướng ngại vật, tránh đếm trùng"""
+        h, w = frame_shape[:2] if isinstance(frame_shape, tuple) else frame_shape
+
+        for contour in obstacle_contours:
+            M = cv2.moments(contour)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+
+                # Tạo key duy nhất cho vị trí (chia lưới 50x50 pixel)
+                grid_x = cx // 50
+                grid_y = cy // 50
+                key = f"{grid_x}_{grid_y}"
+
+                # Nếu chưa có trong lịch sử, thêm vào và tăng count
+                if key not in self.obstacle_history:
+                    self.obstacle_history[key] = {
+                        'count': 1,
+                        'first_seen': len(self.obstacle_history),
+                        'position': (cx, cy)
+                    }
+                    self.obstacle_count += 1
+
+    def reset_obstacle_count(self):
+        """Reset bộ đếm chướng ngại vật (gọi khi bắt đầu video/camera mới)"""
+        self.obstacle_count = 0
+        self.obstacle_history = {}
 
     def _calculate_quality_score(self, edge_density, dark_ratio, texture,
                                   pothole_count, crack_count, water_count):
         """Tính điểm chất lượng đường"""
         score = 100
-
-        # Mật độ cạnh cao -> đường gồ ghề
         score -= min(edge_density * 150, 25)
-
-        # Nhiều vùng tối -> có ổ gà
         score -= min(dark_ratio * 250, 40)
-
-        # Texture phức tạp -> bề mặt không đều
         score -= min(texture / 4.0, 15)
-
-        # Có ổ gà thực tế
         score -= min(pothole_count * 8, 30)
-
-        # Có vết nứt
         score -= min(crack_count * 5, 15)
-
-        # Có vũng nước
         score -= min(water_count * 4, 10)
-
         return int(max(0, min(100, score)))
 
     def _get_empty_result(self):
@@ -208,6 +240,9 @@ class RoadAnalyzer:
             'pothole_detected': False,
             'crack_detected': False,
             'water_detected': False,
+            'obstacle_detected': False,
+            'obstacle_count': 0,
+            'total_obstacles': self.obstacle_count,
             'edge_density': 0.0,
             'dark_ratio': 0.0,
             'texture_score': 0.0,
@@ -217,6 +252,7 @@ class RoadAnalyzer:
             'pothole_contours': [],
             'crack_contours': [],
             'water_contours': [],
+            'obstacle_contours': [],
             'road_area': 0,
             'analysis_mask': None
         }
