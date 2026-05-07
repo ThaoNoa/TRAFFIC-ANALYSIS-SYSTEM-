@@ -110,25 +110,6 @@ class ViolationDetector:
                 cv2.putText(frame, f"VUOT TOC DO: {speed:.0f}km/h", (x1, y1-10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-        # === 3. PHÁT HIỆN SAI LÀN (Xe máy đi vào làn ô tô) ===
-        for det in detections:
-            x1, y1, x2, y2 = det['bbox']
-
-            if det['class_name'] == 'xe_may':
-                # Kiểm tra nếu xe máy ở làn ô tô (bên trái khung hình)
-                if x1 < frame_center - 50:
-                    violations.append({
-                        'id': f"{current_time}_wrong_lane_{len(violations)}",
-                        'time': current_time,
-                        'type': 'SAI_LAN',
-                        'description': f'Xe máy đi vào làn ô tô',
-                        'track_id': None,
-                        'bbox': [x1, y1, x2, y2],
-                        'speed': None
-                    })
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    cv2.putText(frame, "SAI LAN", (x1, y1-10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         return violations
 

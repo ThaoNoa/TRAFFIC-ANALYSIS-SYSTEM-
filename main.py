@@ -93,14 +93,38 @@ class TrafficAnalysisApp:
         self.stats = {
             'total_vehicles': 0, 'motorcycles': 0, 'cars': 0, 'trucks': 0,
             'buses': 0, 'persons': 0, 'bicycles': 0, 'violations': 0,
-            'no_helmet': 0, 'speeding': 0, 'wrong_lane': 0, 'obstacles': 0
+            'no_helmet': 0, 'speeding': 0, 'obstacles': 0
         }
+
+        self.counted_track_ids = set()
+
         self._vehicle_classes_speed = frozenset({'xe_may', 'xe_oto', 'xe_bus', 'xe_tai', 'xe_dap'})
         self.violations_log = []
 
         print("=" * 70)
         print("🟢 HỆ THỐNG SẴN SÀNG")
         print("=" * 70)
+
+    def _is_new_vehicle(self, center_x, center_y, current_frame):
+        """
+        Kiểm tra xe có phải mới (chưa đếm) không.
+        Dùng lưới để gom các vị trí gần nhau.
+        """
+        grid_x = center_x // self.position_grid_size
+        grid_y = center_y // self.position_grid_size
+        key = (grid_x, grid_y)
+
+        if key not in self.seen_vehicles:
+            # Chưa từng thấy xe ở ô này
+            self.seen_vehicles[key] = current_frame
+            return True
+        else:
+            last_seen = self.seen_vehicles[key]
+            # Nếu đã lâu không thấy xe ở ô này (hoặc xe đã rời đi), cho đếm lại
+            if current_frame - last_seen > self.seen_frames_threshold:
+                self.seen_vehicles[key] = current_frame
+                return True
+            return False
 
     def create_ui(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -350,7 +374,11 @@ class TrafficAnalysisApp:
             'buses': 0, 'persons': 0, 'bicycles': 0, 'violations': 0,
             'no_helmet': 0, 'speeding': 0, 'wrong_lane': 0, 'obstacles': 0
         }
+
+        self.counted_track_ids.clear()
+
         self.violations_log = []
+        self.counted_track_ids.clear()
 
         if hasattr(self, 'road_analyzer'):
             self.road_analyzer.reset_obstacle_count()
@@ -459,10 +487,70 @@ class TrafficAnalysisApp:
                                     self.stats['wrong_lane'] += 1
                                 self.stats['violations'] = len(self.violations_log)
 
-                        frame_stats = self.detector.get_stats()
-                        for key in frame_stats:
-                            if key in self.stats:
-                                self.stats[key] += frame_stats[key]
+                                confident_detections = []
+                                bboxes = []
+                                confs = []
+
+                                for d in detections:
+                                    w = d['bbox'][2] - d['bbox'][0]
+                                    h = d['bbox'][3] - d['bbox'][1]
+
+                                    # ĐẠI CHÂM FPS: TUYỆT ĐỐI không ép AI Tracker trích xuất đặc trưng cho cục sạn < 250 pixel
+                                    # Giúp lược gánh năng lên Mobilenet -> CPU tăng độ nhạy cực kinh
+                                    if w * h > 350 and d['confidence'] >= 0.40:
+                                        confident_detections.append(d)
+                                        bboxes.append(d['bbox'])
+                                        confs.append(d['confidence'])
+
+                                # Truyền bộ nhận nhiện Cực Thu gọn Vào DeepSORT! Tracker múa bay Frame !!!
+                                tracks = self.tracker.update(bboxes, frame_with_detections, detections_confs=confs)
+
+                                frame_with_tracks = self.tracker.draw_tracks(frame_with_detections.copy(), tracks)
+                                frame_result = frame_with_tracks
+
+                                # Quét rà Check Box Vẫn hoạt Động Hoàn toàn Độc lập Trực tính Của Hệ Không Sai Số:
+                                violations = self.violation_detector.detect(frame_with_tracks, confident_detections,
+                                                                            tracks)
+
+                                for v in violations:
+                                    if v not in self.violations_log:
+                                        self.violations_log.append(v)
+                                        self.log(f"🚨 {v['type']} - {v['description']}")
+                                        if v['type'] == 'KHONG_DOI_MU':
+                                            self.stats['no_helmet'] += 1
+                                        elif v['type'] == 'VUOT_TOC_DO':
+                                            self.stats['speeding'] += 1
+                                        elif v['type'] == 'SAI_LAN':
+                                            self.stats['wrong_lane'] += 1
+                                        self.stats['violations'] = len(self.violations_log)
+
+                                # Logic chống trùng số học Tự Tính
+                                for track in tracks:
+                                    track_id = track['track_id']
+                                    if track_id not in self.counted_track_ids:
+
+                                        best_det = best_detection_for_track(track['bbox'], confident_detections)
+                                        if best_det is not None:
+                                            class_name = best_det['class_name']
+
+                                            if class_name in ['xe_may', 'xe_oto', 'xe_tai', 'xe_bus', 'xe_dap']:
+                                                self.stats['total_vehicles'] += 1
+
+                                            if class_name == 'xe_may':
+                                                self.stats['motorcycles'] += 1
+                                            elif class_name == 'xe_oto':
+                                                self.stats['cars'] += 1
+                                            elif class_name == 'xe_tai':
+                                                self.stats['trucks'] += 1
+                                            elif class_name == 'xe_bus':
+                                                self.stats['buses'] += 1
+                                            elif class_name == 'xe_dap':
+                                                self.stats['bicycles'] += 1
+                                            elif class_name == 'nguoi':
+                                                self.stats['persons'] += 1
+
+                                            # Cho Tracker nhai kẹo dính vĩnh viễn (ID bị ngậm kén, thoát là đếm xong)
+                                            self.counted_track_ids.add(track_id)
 
                         frame_result = frame_with_detections
 

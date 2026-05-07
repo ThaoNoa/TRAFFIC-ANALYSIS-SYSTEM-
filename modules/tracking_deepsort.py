@@ -7,18 +7,19 @@ import numpy as np
 import cv2
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
+
 def _clamp_bbox_xyxy(x1, y1, x2, y2, fw, fh):
-    """Giữ bbox trong ảnh và tránh box phình to bất thường (Kalman trôi)."""
+    """Giữ bbox trong ảnh và tránh box phình to bất thường."""
     x1 = float(np.clip(x1, 0, max(0, fw - 1)))
     x2 = float(np.clip(x2, 0, fw))
     y1 = float(np.clip(y1, 0, max(0, fh - 1)))
     y2 = float(np.clip(y2, 0, fh))
-    if x2 <= x1 + 1:
-        x2 = min(fw, x1 + 2)
-    if y2 <= y1 + 1:
-        y2 = min(fh, y1 + 2)
+    if x2 <= x1 + 1: x2 = min(fw, x1 + 2)
+    if y2 <= y1 + 1: y2 = min(fh, y1 + 2)
+
     bw, bh = x2 - x1, y2 - y1
-    max_w, max_h = 0.55 * fw, 0.55 * fh
+    # Chỉ bóp chống to lên nếu tracker Kalmar tự diễn mất nảy box lọt trời (Hệ xả Track cũ k móp 50% xe khách do box to đâu - đây chuẩn 70)
+    max_w, max_h = 0.70 * fw, 0.70 * fh
     if bw > max_w:
         cx = (x1 + x2) * 0.5
         half = max_w * 0.5
@@ -34,37 +35,27 @@ def _clamp_bbox_xyxy(x1, y1, x2, y2, fw, fh):
 
 class DeepSORTTracker:
     def __init__(self,
-                 max_age=12,           # Đủ để gánh 1–2 frame mất khớp, vẫn không “ma” lâu
-                 n_init=1,             # Xác nhận ngay frame đầu có detection → box sớm
-                 nn_budget=100,        # Số đặc trưng lưu trữ tối đa mỗi track
-                 max_cosine_distance=0.3,  # Ngưỡng cosine distance (λ=0.7 tương đương)
+                 max_age=12,
+                 n_init=1,
+                 nn_budget=50,  # <-- GIẢM THỐNG KÊ XUỐNG CÒN NỬA ĐỂ RAM ĐỌC TRUY XUẤT BAY
+                 max_cosine_distance=0.3,
                  bbox_smooth_alpha=0.22):
-        """
-        Khởi tạo DeepSORT tracker với tham số tối ưu cho xe máy tại Lĩnh Nam
 
-        Args:
-            max_age: Tuổi tối đa của track khi mất dấu
-            n_init: Số frame cần để xác nhận track
-            nn_budget: Số lượng đặc trưng lưu trữ
-            max_cosine_distance: Ngưỡng cosine distance (λ=0.7 trong báo cáo)
-        """
-        # Tham số λ=0.7 được thể hiện qua max_cosine_distance
-        # Công thức: λ * d_cosine + (1-λ) * d_iou
-        # Với λ=0.7, ưu tiên đặc trưng ngoại hình hơn vị trí IOU
+        import torch  # CHUYÊN NẠP Pytorch hardware bypass vao
+        use_half_precision = True if torch.cuda.is_available() else False  # Không cho máy kẹt FPS
+
         self.tracker = DeepSort(
             max_age=max_age,
             n_init=n_init,
             nms_max_overlap=1.0,
-            max_cosine_distance=max_cosine_distance,  # λ=0.7 tương ứng
+            max_cosine_distance=max_cosine_distance,
             nn_budget=nn_budget,
-            # Sử dụng embedder nhẹ để tăng tốc độ
             embedder="mobilenet",
-            half=True,  # FP16 để tăng tốc
+            half=use_half_precision,  # <- ÁP CHẾ GPU vs CPU thông minh. SẼ X5 FRAME RATE
             bgr=True
         )
         self.bbox_smooth_alpha = bbox_smooth_alpha
         self._bbox_ema = {}
-        print("DeepSORT Tracker initialized - λ=0.7 optimized for Lĩnh Nam motorcycles")
 
     def reset_bbox_smoothing(self):
         self._bbox_ema.clear()
