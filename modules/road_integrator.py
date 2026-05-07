@@ -145,30 +145,30 @@ class RoadIntegrator:
             contour_abs[:, :, 1] += y1
             cv2.drawContours(annotated, [contour_abs], -1, (0, 165, 255), 2)
 
-        # ----- 6. BẢNG THÔNG TIN -----
-        info_x, info_y = w - 450, 30
-        cv2.rectangle(annotated, (info_x-10, info_y-30),
-                     (info_x+440, info_y+160), (0, 0, 0), -1)
+        # # ----- 6. BẢNG THÔNG TIN -----
+        # info_x, info_y = w - 450, 30
+        # cv2.rectangle(annotated, (info_x-10, info_y-30),
+        #              (info_x+440, info_y+160), (0, 0, 0), -1)
+        #
+        # # Tiêu đề
+        # cv2.putText(annotated, "PHAN TICH MAT DUONG",
+        #            (info_x, info_y-5), cv2.FONT_HERSHEY_SIMPLEX,
+        #            0.7, (255, 255, 255), 2)
+        #
+        # # Thông tin
+        # y_offset = info_y + 20
+        # lines = [
+        #     f"Tinh trang: {result['condition']}",
+        #     f"Chat luong: {result['quality_score']}%",
+        #     f"O ga: {result['pothole_count']} | Vet nut: {result['crack_count']}",
+        #     f"Mat do canh: {result['edge_density']:.3f}",
+        #     f"Vung phan tich: ({x1},{y1})-({x2},{y2})",
+        #     f"Dien tich duong: {result['road_area']} px"
+        # ]
 
-        # Tiêu đề
-        cv2.putText(annotated, "PHAN TICH MAT DUONG",
-                   (info_x, info_y-5), cv2.FONT_HERSHEY_SIMPLEX,
-                   0.7, (255, 255, 255), 2)
-
-        # Thông tin
-        y_offset = info_y + 20
-        lines = [
-            f"Tinh trang: {result['condition']}",
-            f"Chat luong: {result['quality_score']}%",
-            f"O ga: {result['pothole_count']} | Vet nut: {result['crack_count']}",
-            f"Mat do canh: {result['edge_density']:.3f}",
-            f"Vung phan tich: ({x1},{y1})-({x2},{y2})",
-            f"Dien tich duong: {result['road_area']} px"
-        ]
-
-        for i, line in enumerate(lines):
-            color = (0, 0, 255) if i == 1 and result['pothole_detected'] else (255, 255, 255)
-            cv2.putText(annotated, line, (info_x, y_offset + i*20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        # for i, line in enumerate(lines):
+        #     color = (0, 0, 255) if i == 1 and result['pothole_detected'] else (255, 255, 255)
+        #     cv2.putText(annotated, line, (info_x, y_offset + i*20),
+        #                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
         return annotated
